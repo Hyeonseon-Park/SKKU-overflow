@@ -72,6 +72,9 @@ sema_down (struct semaphore *sema)
 //      list_push_back (&sema->waiters, &thread_current ()->elem);
       list_insert_ordered (&sema->waiters, &thread_current ()->elem,
 			   thread_compare_priority, 0);
+
+      list_sort(&thread_current()->lock_list, lock_priority_higher_sort, NULL);
+
       thread_block ();
     }
   sema->value--;
@@ -116,9 +119,11 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
-  if (!list_empty (&sema->waiters)) 
+  if (!list_empty (&sema->waiters)){
+    list_sort(&sema->waiters, thread_compare_priority, NULL);
     thread_unblock (list_entry (list_pop_front (&sema->waiters),
                                 struct thread, elem));
+  }
   sema->value++;
   intr_set_level (old_level);
 }
@@ -195,12 +200,25 @@ lock_init (struct lock *lock)
 void
 lock_acquire (struct lock *lock)
 {
+  struct thread *cur;
+  enum intr_level old_level = intr_disable(); //added
+
   ASSERT (lock != NULL);
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
+  cur = thread_current ();
+
+  cur->trying_lock = lock;
+
+  donate_priority(lock);
+
   sema_down (&lock->semaphore);
-  lock->holder = thread_current ();
+  lock->holder = cur; /* thread_current () --> cur */
+
+  list_insert_ordered (&cur->lock_list, &cur->trying_lock->elem, lock_priority_higher_sort, 0);
+  cur->trying_lock = NULL;
+  intr_set_level(old_level); //added
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -231,11 +249,29 @@ lock_try_acquire (struct lock *lock)
 void
 lock_release (struct lock *lock) 
 {
+  struct thread *cur;
+  enum intr_level old_level = intr_disable(); //added
+
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
 
+  cur = thread_current ();
+
+  list_remove (&lock->elem);
+  if(cur->donate_count == 1)
+  {
+    recover_donate_priority (lock);
+  }
+
   lock->holder = NULL;
   sema_up (&lock->semaphore);
+
+  if (list_empty (&cur->lock_list))
+    cur->donate_count = 0;
+
+  thread_yield ();
+
+  intr_set_level(old_level); //added
 }
 
 /* Returns true if the current thread holds LOCK, false

@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "fixed_point.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -91,6 +92,14 @@ struct thread
     int64_t wakeup_tick;                /* Tick to wakeup when sleeping. */
     struct list_elem allelem;           /* List element for all threads list. */
 
+    int original_priority;		/* Priority before donation occur */
+    int donate_count;			/* Donation occur or not */
+    struct lock *trying_lock;		/* Lock (try to acquire but waiting) */
+    struct list lock_list;		/* Lock that thread is owning */
+
+    int nice;				/* Nice value for set recent_cpu */
+    fixed_point recent_cpu;		/* recent cpu time for set priority */
+
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
@@ -148,5 +157,10 @@ void thread_awake (int64_t);
 /* Added for project 1 - Priority Scheduling */
 bool thread_compare_priority (const struct list_elem *, const struct list_elem *, void *);
 void thread_test_priority_cur_and_ready(void);
+
+/* Added for project 1 - Priority Donation */
+void donate_priority (struct lock *);
+void recover_donate_priority (struct lock *);
+bool lock_priority_higher_sort (const struct list_elem *, const struct list_elem *, void *);
 
 #endif /* threads/thread.h */

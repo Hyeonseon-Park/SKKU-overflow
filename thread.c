@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "threads/fixed_point.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -66,6 +67,11 @@ static int64_t next_tick_to_awake; /* smallest tick to awake in sleeping_list */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+
+/* For project_1 mlfqs */
+fixed_point load_avg;
+
+
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -116,6 +122,8 @@ thread_start (void)
   struct semaphore idle_started;
   sema_init (&idle_started, 0);
   thread_create ("idle", PRI_MIN, idle, &idle_started);
+
+  load_avg = int_to_FP(0);
 
   /* Start preemptive thread scheduling. */
   intr_enable ();
@@ -347,6 +355,11 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  if (thread_current ()->donate_count == 1){
+    thread_current ()->original_priority = new_priority;
+    return;
+  }
+
   thread_current ()->priority = new_priority;
 
   /* Test if the new priority is less than a priority of ready thread */
@@ -365,6 +378,14 @@ void
 thread_set_nice (int nice UNUSED) 
 {
   /* Not yet implemented. */
+  enum intr_level old_level = intr_disable ();
+
+  thread_current ()->nice = nice;
+  mlfqs_calculate_priority(thread_current ());
+
+  thread_test_priorit_cur_and_ready ();
+
+  intr_set_level (old_level);
 }
 
 /* Returns the current thread's nice value. */
@@ -372,7 +393,7 @@ int
 thread_get_nice (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return thread_current()->nice;
 }
 
 /* Returns 100 times the system load average. */
@@ -380,7 +401,7 @@ int
 thread_get_load_avg (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return round_FP(mul_FP_int(load_avg,100));
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
@@ -388,7 +409,7 @@ int
 thread_get_recent_cpu (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  return round_FP(mul_FP_int(thread_current()->recent_cpu, 100));
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -478,6 +499,11 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+  t->donate_count = 0; //project_1 priority donation
+  t->nice = 0; //project_1 mlfqs
+  t->recent_cpu = int_to_FP(0); //project_1 mlfqs
+
+  list_init(&t->lock_list); //project_1 priority donation
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
@@ -508,7 +534,10 @@ next_thread_to_run (void)
   if (list_empty (&ready_list))
     return idle_thread;
   else
+  {
+    list_sort(&ready_list, thread_compare_priority, 0);
     return list_entry (list_pop_front (&ready_list), struct thread, elem);
+  }
 }
 
 /* Completes a thread switch by activating the new thread's page
@@ -678,6 +707,11 @@ thread_compare_priority (const struct list_elem *a, const struct list_elem *b, v
 void
 thread_test_priority_cur_and_ready (void)
 {
+  if (list_empty(&ready_list))
+    return;
+
+  ASSERT(!list_empty(&ready_list)); /* Added the codes because the program died for ASSERT(!list_empty(&list) in list_front() in some test cases for goal 3,4 */
+
   struct thread *cur = thread_current();
   struct list_elem *e = list_front(&ready_list);
   if (!list_empty(&ready_list) && cur->priority 
@@ -685,6 +719,94 @@ thread_test_priority_cur_and_ready (void)
   {
     thread_yield();
   }
+}
+
+
+/* Project 1 - Priority Donation */
+
+/* When current thread call lock acquire(a), this function is called */
+/* If lock a is already own by lower-priority-thread, priority donation occur */
+
+void
+donate_priority(struct lock *_lock)
+{
+  struct thread *lock_holder_thread;
+  struct thread *cur = thread_current();
+
+  ASSERT(_lock!=NULL);
+
+  if (_lock->holder == NULL)
+    return;
+
+  lock_holder_thread = _lock->holder;
+
+  if (cur->priority > lock_holder_thread->priority){
+    if (lock_holder_thread->donate_count == 0){
+      lock_holder_thread->original_priority = lock_holder_thread->priority;
+      lock_holder_thread->donate_count = 1;
+    }
+    lock_holder_thread->priority = cur->priority;
+
+    /* If lock_holder_thread is waiting for other lock. */
+    if (lock_holder_thread->trying_lock != NULL)
+      donate_priority(lock_holder_thread->trying_lock);
+  }
+}
+
+/* When current thread call lock_release(a), this function is called. */
+void
+recover_donate_priority(struct lock *_lock)
+{
+  enum intr_level old_level;
+  struct thread *cur = thread_current ();
+  struct thread *highest_priority_thread;
+  struct lock *highest_priority_lock;
+
+  ASSERT (_lock!=NULL);
+  old_level = intr_disable ();
+
+  if (_lock->holder == NULL){
+    intr_set_level (old_level);
+    return;
+  }
+
+  if (list_empty (&cur->lock_list) && cur->donate_count == 1){
+    cur->priority = cur->original_priority;
+    return;
+  }
+
+  else if (!list_empty(&cur->lock_list)){
+    highest_priority_lock = list_entry(list_front(&cur->lock_list), struct lock, elem);
+
+    if (list_empty(&highest_priority_lock->semaphore.waiters)){
+      cur->priority = cur->original_priority;
+      return;
+    }
+
+    highest_priority_thread = list_entry(list_front(&highest_priority_lock->semaphore.waiters), struct thread, elem);
+
+    cur->priority = highest_priority_thread->priority;
+  }
+
+  intr_set_level (old_level);
+}
+
+/* if priority of first thread of (new_lock->semaphore.waiters) > (origin_lock...), return true */
+bool
+lock_priority_higher_sort (const struct list_elem *new_elem, const struct list_elem *origin_elem, void *aux UNUSED)
+{
+  struct lock *new_lock = list_entry(new_elem, struct lock, elem);
+  struct lock *origin_lock = list_entry(origin_elem, struct lock, elem);
+
+  if (list_empty(&origin_lock->semaphore.waiters))
+    return true;
+  else if (list_empty(&new_lock->semaphore.waiters))
+    return false;
+
+  const struct thread *new_thread = list_entry(list_front(&new_lock->semaphore.waiters), struct thread, elem);
+  const struct thread *origin_thread = list_entry(list_front(&origin_lock->semaphore.waiters), struct thread, elem);
+
+  return new_thread->priority >= origin_thread->priority;
 }
 
 
